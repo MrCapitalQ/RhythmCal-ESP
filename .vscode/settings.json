@@ -25,5 +25,12 @@
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\Q\\Dev\\MrCapitalQ\\RhythmCal-ESP\\build"
   ],
-  "idf.currentSetup": "W:\\ESP\\.espressif\\v6.1\\esp-idf"
+  "idf.currentSetup": "W:\\ESP\\.espressif\\v6.1\\esp-idf",
+  "idf.flashType": "UART",
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ],
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  }
 }
