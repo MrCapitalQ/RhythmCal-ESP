@@ -82,6 +82,24 @@ static void process_light_samples(int samples[], int count)
 
 static void process_sound_samples(int samples[], int count)
 {
+    int sample_min = 4095;
+    int sample_max = 0;
+
+    for (int i = 0; i < count; i++)
+    {
+        int sample = samples[i];
+
+        if (sample < sample_min)
+            sample_min = sample;
+        if (sample > sample_max)
+            sample_max = sample;
+    }
+
+    int amp = sample_max - sample_min;
+
+#if (LOG_OUTPUT_MODE)
+    ESP_LOGI(TAG, "Sound: %d (%d samples)", amp, count);
+#endif
 }
 
 void app_main(void)
