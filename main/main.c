@@ -15,10 +15,15 @@
 
 #define CONVERSION_FRAME_SIZE 128
 
+#define BASELINE_ALPHA 0.01
+
 static const char *TAG = "RhythmCal";
 
 static adc_channel_t channel[2] = {LIGHT_CHANNEL, SOUND_CHANNEL};
 static TaskHandle_t s_task_handle;
+
+static int light_baseline = -1;
+static int sound_baseline = -1;
 
 #pragma region "Continuous ADC"
 static bool IRAM_ATTR s_conv_done_cb(adc_continuous_handle_t handle, const adc_continuous_evt_data_t *edata, void *user_data)
@@ -62,10 +67,20 @@ static void continuous_adc_init(adc_channel_t *channel, uint8_t channel_num, adc
 }
 #pragma endregion
 
-static void process_light_samples(int samples[], int count)
+#pragma region "Sensor Data Handling"
+static inline void update_baseline(int *baseline, int reading)
+{
+    // Negative baseline means it hasn't been initialized so we set the first value as the starting baseline.
+    if (*baseline < 0)
+        *baseline = reading;
+    else
+        *baseline = BASELINE_ALPHA * reading + (1 - BASELINE_ALPHA) * *baseline;
+}
+
+static int calculate_light_value(int samples[], int count)
 {
     if (count == 0)
-        return;
+        return -1;
 
     int sum = 0;
     for (int i = 0; i < count; i++)
@@ -73,15 +88,14 @@ static void process_light_samples(int samples[], int count)
         sum += samples[i];
     }
 
-    int average = sum / count;
-
-#if (LOG_OUTPUT_MODE)
-    ESP_LOGI(TAG, "Light: %d (%d samples)", average, count);
-#endif
+    return sum / count;
 }
 
-static void process_sound_samples(int samples[], int count)
+static int calculate_sound_value(int samples[], int count)
 {
+    if (count == 0)
+        return -1;
+
     int sample_min = 4095;
     int sample_max = 0;
 
@@ -95,12 +109,9 @@ static void process_sound_samples(int samples[], int count)
             sample_max = sample;
     }
 
-    int amp = sample_max - sample_min;
-
-#if (LOG_OUTPUT_MODE)
-    ESP_LOGI(TAG, "Sound: %d (%d samples)", amp, count);
-#endif
+    return sample_max - sample_min;
 }
+#pragma endregion
 
 void app_main(void)
 {
@@ -133,7 +144,11 @@ void app_main(void)
                 adc_continuous_data_t parsed_data[ret_num / SOC_ADC_DIGI_RESULT_BYTES];
                 uint32_t num_parsed_samples = 0;
 
-                esp_err_t parse_ret = adc_continuous_parse_data(handle, result, ret_num, parsed_data, &num_parsed_samples);
+                esp_err_t parse_ret = adc_continuous_parse_data(handle,
+                                                                result,
+                                                                ret_num,
+                                                                parsed_data,
+                                                                &num_parsed_samples);
 
                 if (parse_ret == ESP_OK)
                 {
@@ -175,8 +190,27 @@ void app_main(void)
                         }
                     }
 
-                    process_light_samples(light_samples, light_sample_count);
-                    process_sound_samples(sound_samples, sound_sample_count);
+                    int light = calculate_light_value(light_samples, light_sample_count);
+                    if (light >= 0)
+                    {
+                        update_baseline(&light_baseline, light);
+                    }
+
+                    int sound = calculate_sound_value(sound_samples, sound_sample_count);
+                    if (sound >= 0)
+                    {
+                        update_baseline(&sound_baseline, sound);
+                    }
+
+#if (LOG_OUTPUT_MODE)
+                    ESP_LOGI(TAG, "Light baseline: %d, Light: %d (%d samples), Sound baseline: %d, Sound: %d (%d samples)",
+                             light_baseline,
+                             light,
+                             light_sample_count,
+                             sound_baseline,
+                             sound,
+                             sound_sample_count);
+#endif
                 }
                 else
                 {
