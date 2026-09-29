@@ -2,21 +2,39 @@
 #include <string.h>
 #include "esp_adc/adc_continuous.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
+
+#define LOG_OUTPUT_MODE true
+#define LOG_RAW_SENSOR_VALUES false
+#define LOG_CURRENT_READINGS false
 
 #define LIGHT_CHANNEL ADC_CHANNEL_8
 #define SOUND_CHANNEL ADC_CHANNEL_7
 
 #define CONVERSION_FRAME_SIZE 128
 
+#define BASELINE_ALPHA 0.01
+#define LIGHT_TRIGGER_THRESHOLD 200
+#define SOUND_TRIGGER_THRESHOLD 200
+#define TRIGGER_COOLDOWN_MS 100
+
 static const char *TAG = "RhythmCal";
 
 static adc_channel_t channel[2] = {LIGHT_CHANNEL, SOUND_CHANNEL};
 static TaskHandle_t s_task_handle;
 
+static int light_baseline = -1;
+static int sound_baseline = -1;
+static bool is_light_triggered = 0;
+static bool is_sound_triggered = 0;
+static int64_t last_light_trigger_time = 0;
+static int64_t last_sound_trigger_time = 0;
+
+#pragma region "Continuous ADC"
 static bool IRAM_ATTR s_conv_done_cb(adc_continuous_handle_t handle, const adc_continuous_evt_data_t *edata, void *user_data)
 {
     BaseType_t mustYield = pdFALSE;
@@ -56,6 +74,85 @@ static void continuous_adc_init(adc_channel_t *channel, uint8_t channel_num, adc
 
     *out_handle = handle;
 }
+#pragma endregion
+
+#pragma region "Sensor Data Handling"
+static inline void update_baseline(int *baseline, int reading)
+{
+    // Negative baseline means it hasn't been initialized so we set the first value as the starting baseline. Otherwise
+    // update baseline based on exponential moving average (EMA).
+    if (*baseline < 0)
+        *baseline = reading;
+    else
+        *baseline = BASELINE_ALPHA * reading + (1 - BASELINE_ALPHA) * *baseline;
+}
+
+static int calculate_light_value(int samples[], int count)
+{
+    if (count == 0)
+        return -1;
+
+    int sum = 0;
+    for (int i = 0; i < count; i++)
+    {
+        sum += samples[i];
+    }
+
+    return sum / count;
+}
+
+static int calculate_sound_value(int samples[], int count)
+{
+    if (count == 0)
+        return -1;
+
+    int sample_min = 4095;
+    int sample_max = 0;
+
+    for (int i = 0; i < count; i++)
+    {
+        int sample = samples[i];
+
+        if (sample < sample_min)
+            sample_min = sample;
+        if (sample > sample_max)
+            sample_max = sample;
+    }
+
+    return sample_max - sample_min;
+}
+
+// Returns whether trigger state was changed.
+static bool update_trigger_state(int current,
+                                 int current_baseline,
+                                 int threshold,
+                                 int64_t now,
+                                 bool *is_currently_triggered,
+                                 int64_t *last_trigger_time)
+{
+    if (!*is_currently_triggered)
+    {
+        int delta = current - current_baseline;
+        if (delta < 0)
+            delta = 0;
+
+        if (delta > threshold)
+        {
+            *is_currently_triggered = true;
+            *last_trigger_time = now;
+
+            return true;
+        }
+    }
+    else if (now > ((*last_trigger_time) + (TRIGGER_COOLDOWN_MS * 1000)))
+    {
+        *is_currently_triggered = false;
+        return true;
+    }
+
+    return false;
+}
+#pragma endregion
 
 void app_main(void)
 {
@@ -88,36 +185,108 @@ void app_main(void)
                 adc_continuous_data_t parsed_data[ret_num / SOC_ADC_DIGI_RESULT_BYTES];
                 uint32_t num_parsed_samples = 0;
 
-                esp_err_t parse_ret = adc_continuous_parse_data(handle, result, ret_num, parsed_data, &num_parsed_samples);
+                esp_err_t parse_ret = adc_continuous_parse_data(handle,
+                                                                result,
+                                                                ret_num,
+                                                                parsed_data,
+                                                                &num_parsed_samples);
 
                 if (parse_ret == ESP_OK)
                 {
+                    int light_samples[num_parsed_samples];
+                    int sound_samples[num_parsed_samples];
+                    int light_sample_count = 0;
+                    int sound_sample_count = 0;
+
                     for (int i = 0; i < num_parsed_samples; i++)
                     {
                         if (parsed_data[i].valid)
                         {
+                            if (parsed_data[i].channel == LIGHT_CHANNEL)
+                            {
+                                light_samples[light_sample_count] = parsed_data[i].raw_data;
+                                light_sample_count++;
+                            }
+                            else if (parsed_data[i].channel == SOUND_CHANNEL)
+                            {
+                                sound_samples[sound_sample_count] = parsed_data[i].raw_data;
+                                sound_sample_count++;
+                            }
+
+#if (LOG_OUTPUT_MODE && LOG_RAW_SENSOR_VALUES)
                             ESP_LOGI(TAG, "ADC%d, Channel: %d, Value: %" PRIu32,
                                      parsed_data[i].unit + 1,
                                      parsed_data[i].channel,
                                      parsed_data[i].raw_data);
+#endif
                         }
                         else
                         {
+#if LOG_OUTPUT_MODE
                             ESP_LOGW(TAG, "Invalid data [ADC%d_Ch%d_%" PRIu32 "]",
                                      parsed_data[i].unit + 1,
                                      parsed_data[i].channel,
                                      parsed_data[i].raw_data);
+#endif
                         }
                     }
+
+                    int64_t now = esp_timer_get_time();
+
+                    int light = calculate_light_value(light_samples, light_sample_count);
+                    if (light >= 0)
+                    {
+                        update_baseline(&light_baseline, light);
+                        bool trigger_state_changed = update_trigger_state(light,
+                                                                          light_baseline,
+                                                                          LIGHT_TRIGGER_THRESHOLD,
+                                                                          now,
+                                                                          &is_light_triggered,
+                                                                          &last_light_trigger_time);
+#if (LOG_OUTPUT_MODE)
+                        if (trigger_state_changed && is_light_triggered)
+                            ESP_LOGI(TAG, "LIGHT TRIGGER!");
+#endif
+                    }
+
+                    int sound = calculate_sound_value(sound_samples, sound_sample_count);
+                    if (sound >= 0)
+                    {
+                        update_baseline(&sound_baseline, sound);
+
+                        bool trigger_state_changed = update_trigger_state(sound,
+                                                                          sound_baseline,
+                                                                          SOUND_TRIGGER_THRESHOLD,
+                                                                          now,
+                                                                          &is_sound_triggered,
+                                                                          &last_sound_trigger_time);
+#if (LOG_OUTPUT_MODE)
+                        if (trigger_state_changed && is_sound_triggered)
+                            ESP_LOGI(TAG, "SOUND TRIGGER!");
+#endif
+                    }
+
+#if (LOG_OUTPUT_MODE && LOG_CURRENT_READINGS)
+                    ESP_LOGI(TAG, "Light baseline: %d, Light: %d (%d samples), Sound baseline: %d, Sound: %d (%d samples)",
+                             light_baseline,
+                             light,
+                             light_sample_count,
+                             sound_baseline,
+                             sound,
+                             sound_sample_count);
+#endif
                 }
                 else
                 {
+#if LOG_OUTPUT_MODE
                     ESP_LOGE(TAG, "Data parsing failed: %s", esp_err_to_name(parse_ret));
+#endif
                 }
 
+#if LOG_OUTPUT_MODE
                 // Only needed because logging is slow.
-                // TODO: Remove or make conditional based on whether we're logging inside data read/conversion loop.
                 vTaskDelay(1);
+#endif
             }
             else if (ret == ESP_ERR_TIMEOUT)
             {
