@@ -7,6 +7,9 @@
 #include "freertos/task.h"
 #include "sdkconfig.h"
 
+#define LOG_OUTPUT_MODE true
+#define LOG_RAW_SENSOR_VALUES false
+
 #define LIGHT_CHANNEL ADC_CHANNEL_8
 #define SOUND_CHANNEL ADC_CHANNEL_7
 
@@ -17,6 +20,7 @@ static const char *TAG = "RhythmCal";
 static adc_channel_t channel[2] = {LIGHT_CHANNEL, SOUND_CHANNEL};
 static TaskHandle_t s_task_handle;
 
+#pragma region "Continuous ADC"
 static bool IRAM_ATTR s_conv_done_cb(adc_continuous_handle_t handle, const adc_continuous_evt_data_t *edata, void *user_data)
 {
     BaseType_t mustYield = pdFALSE;
@@ -56,6 +60,29 @@ static void continuous_adc_init(adc_channel_t *channel, uint8_t channel_num, adc
 
     *out_handle = handle;
 }
+#pragma endregion
+
+static void process_light_samples(int samples[], int count)
+{
+    if (count == 0)
+        return;
+
+    int sum = 0;
+    for (int i = 0; i < count; i++)
+    {
+        sum += samples[i];
+    }
+
+    int average = sum / count;
+
+#if (LOG_OUTPUT_MODE)
+    ESP_LOGI(TAG, "Light: %d (%d samples)", average, count);
+#endif
+}
+
+static void process_sound_samples(int samples[], int count)
+{
+}
 
 void app_main(void)
 {
@@ -92,32 +119,58 @@ void app_main(void)
 
                 if (parse_ret == ESP_OK)
                 {
+                    int light_samples[num_parsed_samples];
+                    int sound_samples[num_parsed_samples];
+                    int light_sample_count = 0;
+                    int sound_sample_count = 0;
+
                     for (int i = 0; i < num_parsed_samples; i++)
                     {
                         if (parsed_data[i].valid)
                         {
+                            if (parsed_data[i].channel == LIGHT_CHANNEL)
+                            {
+                                light_samples[light_sample_count] = parsed_data[i].raw_data;
+                                light_sample_count++;
+                            }
+                            else if (parsed_data[i].channel == SOUND_CHANNEL)
+                            {
+                                sound_samples[sound_sample_count] = parsed_data[i].raw_data;
+                                sound_sample_count++;
+                            }
+
+#if (LOG_OUTPUT_MODE && LOG_RAW_SENSOR_VALUES)
                             ESP_LOGI(TAG, "ADC%d, Channel: %d, Value: %" PRIu32,
                                      parsed_data[i].unit + 1,
                                      parsed_data[i].channel,
                                      parsed_data[i].raw_data);
+#endif
                         }
                         else
                         {
+#if LOG_OUTPUT_MODE
                             ESP_LOGW(TAG, "Invalid data [ADC%d_Ch%d_%" PRIu32 "]",
                                      parsed_data[i].unit + 1,
                                      parsed_data[i].channel,
                                      parsed_data[i].raw_data);
+#endif
                         }
                     }
+
+                    process_light_samples(light_samples, light_sample_count);
+                    process_sound_samples(sound_samples, sound_sample_count);
                 }
                 else
                 {
+#if LOG_OUTPUT_MODE
                     ESP_LOGE(TAG, "Data parsing failed: %s", esp_err_to_name(parse_ret));
+#endif
                 }
 
+#if LOG_OUTPUT_MODE
                 // Only needed because logging is slow.
-                // TODO: Remove or make conditional based on whether we're logging inside data read/conversion loop.
                 vTaskDelay(1);
+#endif
             }
             else if (ret == ESP_ERR_TIMEOUT)
             {
