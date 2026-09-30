@@ -1,14 +1,18 @@
 #include <stdio.h>
 #include <string.h>
+#include "class/hid/hid_device.h"
 #include "esp_adc/adc_continuous.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "sdkconfig.h"
+#include "tinyusb.h"
+#include "tinyusb_default_config.h"
 
-#define LOG_OUTPUT_MODE true
+#define LOG_OUTPUT_MODE false
 #define LOG_RAW_SENSOR_VALUES false
 #define LOG_CURRENT_READINGS false
 
@@ -22,7 +26,26 @@
 #define SOUND_TRIGGER_THRESHOLD 200
 #define TRIGGER_COOLDOWN_MS 100
 
+#define TUSB_DESC_TOTAL_LEN (TUD_CONFIG_DESC_LEN + CFG_TUD_HID * TUD_HID_DESC_LEN)
+
 static const char *TAG = "RhythmCal";
+
+static char serial_number[13];
+static const char *hid_string_descriptor[5] = {
+    (char[]){0x09, 0x04}, // 0: is supported language is English (0x0409)
+    "MrCapitalQ",         // 1: Manufacturer
+    "RhythmCal",          // 2: Product
+    serial_number,        // 3: Serial number from the chip's base MAC address
+    "RhythmCal Sensor",   // 4: HID
+};
+static const uint8_t hid_report_descriptor[] = {TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(HID_ITF_PROTOCOL_KEYBOARD))};
+static const uint8_t hid_configuration_descriptor[] = {
+    // Configuration number, interface count, string index, total length, attribute, power in mA
+    TUD_CONFIG_DESCRIPTOR(1, 1, 0, TUSB_DESC_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+
+    // Interface number, string index, boot protocol, report descriptor len, EP In address, size & polling interval
+    TUD_HID_DESCRIPTOR(0, 4, false, sizeof(hid_report_descriptor), 0x81, 16, 1),
+};
 
 static adc_channel_t channel[2] = {LIGHT_CHANNEL, SOUND_CHANNEL};
 static TaskHandle_t s_task_handle;
@@ -154,8 +177,71 @@ static bool update_trigger_state(int current,
 }
 #pragma endregion
 
+#pragma region "USB"
+static void init_usb_hid()
+{
+    ESP_LOGI(TAG, "USB initialization");
+
+    // Init serial based on mac address.
+    uint8_t mac_address[6];
+    ESP_ERROR_CHECK(esp_efuse_mac_get_default(mac_address));
+    snprintf(serial_number,
+             sizeof(serial_number),
+             "%02X%02X%02X%02X%02X%02X",
+             mac_address[0],
+             mac_address[1],
+             mac_address[2],
+             mac_address[3],
+             mac_address[4],
+             mac_address[5]);
+
+    tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
+
+    tusb_cfg.descriptor.device = NULL;
+    tusb_cfg.descriptor.full_speed_config = hid_configuration_descriptor;
+    tusb_cfg.descriptor.string = hid_string_descriptor;
+    tusb_cfg.descriptor.string_count = sizeof(hid_string_descriptor) / sizeof(hid_string_descriptor[0]);
+
+    ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
+
+    ESP_LOGI(TAG, "USB initialization DONE");
+}
+
+// Invoked when received GET HID REPORT DESCRIPTOR request
+// Application return pointer to descriptor, whose contents must exist long enough for transfer to complete
+uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
+{
+    // We use only one interface and one HID report descriptor, so we can ignore parameter 'instance'
+    return hid_report_descriptor;
+}
+
+// Invoked when received GET_REPORT control request
+// Application must fill buffer report's content and return its length.
+// Return zero will cause the stack to STALL request
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t *buffer, uint16_t reqlen)
+{
+    (void)instance;
+    (void)report_id;
+    (void)report_type;
+    (void)buffer;
+    (void)reqlen;
+
+    return 0;
+}
+
+// Invoked when received SET_REPORT control request or
+// received data on OUT endpoint ( Report ID = 0, Type = 0 )
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer, uint16_t bufsize)
+{
+}
+#pragma endregion
+
 void app_main(void)
 {
+#if (!LOG_OUTPUT_MODE)
+    init_usb_hid();
+#endif
+
     esp_err_t ret;
     uint32_t ret_num = 0;
     uint8_t result[CONVERSION_FRAME_SIZE] = {0};
@@ -232,21 +318,19 @@ void app_main(void)
                     }
 
                     int64_t now = esp_timer_get_time();
+                    bool light_trigger_state_changed = false;
+                    bool sound_trigger_state_changed = false;
 
                     int light = calculate_light_value(light_samples, light_sample_count);
                     if (light >= 0)
                     {
                         update_baseline(&light_baseline, light);
-                        bool trigger_state_changed = update_trigger_state(light,
-                                                                          light_baseline,
-                                                                          LIGHT_TRIGGER_THRESHOLD,
-                                                                          now,
-                                                                          &is_light_triggered,
-                                                                          &last_light_trigger_time);
-#if (LOG_OUTPUT_MODE)
-                        if (trigger_state_changed && is_light_triggered)
-                            ESP_LOGI(TAG, "LIGHT TRIGGER!");
-#endif
+                        light_trigger_state_changed = update_trigger_state(light,
+                                                                           light_baseline,
+                                                                           LIGHT_TRIGGER_THRESHOLD,
+                                                                           now,
+                                                                           &is_light_triggered,
+                                                                           &last_light_trigger_time);
                     }
 
                     int sound = calculate_sound_value(sound_samples, sound_sample_count);
@@ -254,17 +338,43 @@ void app_main(void)
                     {
                         update_baseline(&sound_baseline, sound);
 
-                        bool trigger_state_changed = update_trigger_state(sound,
-                                                                          sound_baseline,
-                                                                          SOUND_TRIGGER_THRESHOLD,
-                                                                          now,
-                                                                          &is_sound_triggered,
-                                                                          &last_sound_trigger_time);
-#if (LOG_OUTPUT_MODE)
-                        if (trigger_state_changed && is_sound_triggered)
-                            ESP_LOGI(TAG, "SOUND TRIGGER!");
-#endif
+                        sound_trigger_state_changed = update_trigger_state(sound,
+                                                                           sound_baseline,
+                                                                           SOUND_TRIGGER_THRESHOLD,
+                                                                           now,
+                                                                           &is_sound_triggered,
+                                                                           &last_sound_trigger_time);
                     }
+
+#if (LOG_OUTPUT_MODE)
+                    if (light_trigger_state_changed && is_light_triggered)
+                        ESP_LOGI(TAG, "LIGHT TRIGGER!");
+
+                    if (sound_trigger_state_changed && is_sound_triggered)
+                        ESP_LOGI(TAG, "SOUND TRIGGER!");
+#else
+                    // Update key press state based on current trigger state
+                    if (light_trigger_state_changed || sound_trigger_state_changed)
+                    {
+                        if (is_light_triggered && !is_sound_triggered)
+                        {
+                            uint8_t keycode[6] = {HID_KEY_F13};
+                            tud_hid_keyboard_report(HID_ITF_PROTOCOL_KEYBOARD, 0, keycode);
+                        }
+                        else if (!is_light_triggered && is_sound_triggered)
+                        {
+                            uint8_t keycode[6] = {HID_KEY_F14};
+                            tud_hid_keyboard_report(HID_ITF_PROTOCOL_KEYBOARD, 0, keycode);
+                        }
+                        else if (is_light_triggered && is_sound_triggered)
+                        {
+                            uint8_t keycode[6] = {HID_KEY_F13, HID_KEY_F14};
+                            tud_hid_keyboard_report(HID_ITF_PROTOCOL_KEYBOARD, 0, keycode);
+                        }
+                        else
+                            tud_hid_keyboard_report(HID_ITF_PROTOCOL_KEYBOARD, 0, NULL);
+                    }
+#endif
 
 #if (LOG_OUTPUT_MODE && LOG_CURRENT_READINGS)
                     ESP_LOGI(TAG, "Light baseline: %d, Light: %d (%d samples), Sound baseline: %d, Sound: %d (%d samples)",
